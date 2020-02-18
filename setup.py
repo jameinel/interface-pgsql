@@ -8,6 +8,7 @@ setup(
     author="John Arbash Meinel",
     author_email="john.meinel@canonical.com",
     url="https://github.com/jameinel/interface-pgsql",
+    license="LGPL-v3"
     py_modules=["client"],
     install_requires=["PyYAML"],
     dependency_links=[
@@ -20,6 +21,6 @@ setup(
         "Programming Language :: Python :: 3.6",
         "Programming Language :: Python :: 3.7",
 
-        "License :: OSI Approved :: Apache Software License",
+        "License :: OSI Approved :: GNU Lesser General Public License v3 (LGPLv3)",
     ],
 )
