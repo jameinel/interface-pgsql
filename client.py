@@ -61,6 +61,12 @@ class PostgreSQLMasterChanged(EventBase):
         super().__init__(handle)
         self.master = master
 
+    def snapshot(self):
+        return {'master': self.master}
+
+    def restore(self, snapshot):
+        self.master = snapshot['master']
+
 
 class PostgreSQLEvents(EventsBase):
     master_changed = EventSource(PostgreSQLMasterChanged)
@@ -124,9 +130,13 @@ class PostgreSQLClient(EventsBase):
         relation = event.relation  # type: ops.model.Relation
         data = relation.data[event.unit]
         # TODO: do we check if any related units have a 'master' set?
+        #  Also, we need to check if we actually have the database, roles, and access that we want
         master = data.get('master')
         if master is not None:
+            should_emit = self.state.master != master
+        if should_emit:
             self.state.master = master
+            self.on.master_changed.emit(master)
 
     def on_relation_broken(self, event):
         pass

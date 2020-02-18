@@ -58,7 +58,7 @@ class FakeModelBackend:
         return self._relation_list_map[relation_id]
 
     def relation_get(self, relation_id, member_name, is_app):
-        return self._relation_data[relation_id][member_name]
+        return self._relation_data[relation_id][member_name].copy()
 
     def relation_set(self, relation_id, key, value, is_app):
         relation = self._relation_data[relation_id]
@@ -151,31 +151,25 @@ class FakeModelBuilder:
         self.fake_backend._relation_data[rel_id] = relation_data
         return rel_id
 
+    def set_relation_data(self, relation_id, name, data):
+        """Set the data in the relation identified by relation_id for the unit/app 'name' to the supplied data.
 
-def build_relation_changed_args(model, fake_backend, relation_id, remote_name, remote_data):
-    if relation_id not in fake_backend._relation_names:
-        raise RuntimeError(f"relation_id: {relation_id} not in relation_names map")
-    # TODO: we could check that remote_name is part of the fake_backend._relation_list_map[relation_id]
-    relation_name = fake_backend._relation_names[relation_id]
-    fake_backend._relation_data[relation_id][remote_name] = remote_data
-    if '/' in remote_name:
-        remote_unit_name = remote_name
-        remote_app_name = remote_name.split('/')[0]
-    else:
-        remote_app_name = remote_name
-        remote_unit_name = None
-    relation = model.get_relation(relation_name, relation_id)
-    remote_app = model.get_app(remote_app_name)
-    if remote_unit_name is not None:
-        remote_unit = model.get_unit(remote_unit_name)
-        return (relation, remote_app, remote_unit)
-    else:
-        return (relation, remote_app)
+        :param relation_id: the integer relation id
+        :param name: A unit_name or app_name. this may be the local or remote app
+        :param data: A dict of data to set
+        """
+        if not isinstance(data, dict):
+            raise RuntimeError(f'data should be some sort of dict, not {type(data)}')
+        if relation_id not in self.fake_backend._relation_names:
+            raise RuntimeError(f"relation_id: {relation_id} not in relation_names map")
+        # TODO: we could check that remote_name is part of the fake_backend._relation_list_map[relation_id]
+        self.fake_backend._relation_data[relation_id][name] = data
 
 
-class TestPostgreSQLClient(unittest.TestCase):
+class TestFakeCharmBase(unittest.TestCase):
 
     def setUp(self):
+        super().setUp()
         self.tmpdir = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self.tmpdir)
         # language=YAML
@@ -190,12 +184,52 @@ requires:
         self.fake_builder = FakeModelBuilder(self.fake_backend)
         self.model = model.Model(self.unit_name, self.meta, self.fake_backend)
         self.framework = framework.Framework(":memory:", self.tmpdir, self.meta, self.model)
-        self.charm = charm.CharmBase(self.framework, "charm")
+        self.addCleanup(self.framework.close)
+        # Event registration modifies the type with new attributes.
+        # So we need a new event and charm class for every test case, even though
+        # these aren't any different from the underlying class.
+        class MyEvents(charm.CharmEvents):
+            pass
+        class MyCharm(charm.CharmBase):
+            on = MyEvents()
+        self.charm = MyCharm(self.framework, "charm")
         self.client = client.PostgreSQLClient(self.charm, "db")
 
-    def test_stable_relation(self):
-        # language=YAML
-        relationContent = yaml.safe_load('''
+    def relation_changed(self, relation_id, remote_name, remote_data):
+        self.fake_builder.set_relation_data(relation_id, remote_name, remote_data)
+        relation_name = self.fake_builder.fake_backend._relation_names[relation_id]
+        rel = self.model.get_relation(relation_name, relation_id)
+        if '/' in remote_name:
+            remote_unit_name = remote_name
+            remote_app_name = remote_name.split('/')[0]
+        else:
+            remote_app_name = remote_name
+            remote_unit_name = None
+        relation = self.model.get_relation(relation_name, relation_id)
+        remote_app = self.model.get_app(remote_app_name)
+        if remote_unit_name is not None:
+            remote_unit = self.model.get_unit(remote_unit_name)
+            args = (relation, remote_app, remote_unit)
+            # XXX: This is terrible, we need something better
+            rel.data._data[remote_unit]._lazy_data = None
+        else:
+            args = (relation, remote_app)
+            # XXX: This is terrible, we need something better
+            # Force reloading the data
+            rel.data._data[remote_app]._lazy_data = None
+        self.charm.on[relation_name].relation_changed.emit(*args)
+
+    def update_relation(self, relation_id, remote_name, **kwargs):
+        data = self.fake_backend.relation_get(relation_id, remote_name, is_app=('/' in remote_name))
+        data.update(kwargs)
+        self.relation_changed(relation_id, remote_name, data)
+
+
+class TestPostgreSQLClient(TestFakeCharmBase):
+
+    # This is the actual output of 'relation-get' from a stable relation
+    # language=YAML
+    realData = yaml.safe_load('''
 allowed-subnets: 10.210.24.239/32
 allowed-units: hello-juju/0
 database: hello-juju_hello-juju
@@ -213,12 +247,27 @@ state: standalone
 user: juju_hello-juju
 version: "10"
 ''')
+
+    def test_real_relation_data(self):
         rel_id = self.fake_builder.create_relation('db', 'postgresql/0')
-        args = build_relation_changed_args(self.model, self.fake_backend, rel_id, 'postgresql/0',
-                                           remote_data=relationContent)
-        self.charm.on.db_relation_changed.emit(*args)
+        self.relation_changed(rel_id, 'postgresql/0', remote_data=self.realData)
         self.assertEqual('hello-juju_hello-juju', self.client.master().database)
 
+    def test_master_changed(self):
+        remote_unit = 'postgresql/0'
+        rel_id = self.fake_builder.create_relation('db', remote_unit)
+        # change the password
+        # Initialize with the real data
+        self.relation_changed(rel_id, remote_unit, remote_data=self.realData)
+        changes = []
+        class Receiver(framework.Object):
+            def on_master_changed(self, event):
+                changes.append(event.master)
+        r = Receiver(self.framework, 'receiver')
+        self.framework.observe(self.client.on.master_changed, r)
+        new_master = 'dbname=hello-juju_hello-juju host=10.210.24.14 password=2 port=5432 user=juju_hello-juju'
+        self.update_relation(rel_id, remote_unit, master=new_master, password='2')
+        self.assertEqual(changes, [new_master])
 
 if __name__ == '__main__':
     unittest.main()
